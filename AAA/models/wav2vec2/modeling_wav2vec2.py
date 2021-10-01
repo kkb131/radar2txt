@@ -78,6 +78,8 @@ class Wav2Vec2BaseModelOutput(ModelOutput):
     extract_features: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    extract_features2: Optional[torch.FloatTensor] = None
+    hidden_states2: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -1055,12 +1057,13 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
 
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
-
+        extract_features2 = extract_features
         if attention_mask is not None:
             # compute reduced attention_mask correponding to feature vectors
             attention_mask = self._get_feature_vector_attention_mask(extract_features.shape[1], attention_mask)
 
         hidden_states, extract_features = self.feature_projection(extract_features)
+        hidden_states2 = hidden_states
         hidden_states = self._mask_hidden_states(
             hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
         )
@@ -1083,6 +1086,8 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
             extract_features=extract_features,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+            hidden_states2=hidden_states2,
+            extract_features2=extract_features2,
         )
 
 
@@ -1525,15 +1530,18 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutput(
-            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
+            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions,
+            extract_features2 = outputs.extract_features2,
+            hidden_states2 = outputs.hidden_states2,
+
         )
 
 # In[]
 
-class Raadar2VecLayerNormConvLayer(nn.Module):
+class Raadar2VecLayerNorm2DConvLayer(nn.Module):
     def __init__(self, config: Wav2Vec2Config, layer_id=0):
         super().__init__()
-        self.in_conv_ch = config.r_conv2_ch[layer_id] if layer_id > 0 else 1
+        self.in_conv_ch = config.r_conv2_ch[layer_id] if layer_id > 0 else 3
         self.out_conv_ch = config.r_conv2_ch[layer_id]
 
         self.conv = nn.Conv2d(
@@ -1544,18 +1552,9 @@ class Raadar2VecLayerNormConvLayer(nn.Module):
             padding=config.r_conv2_padding[layer_id],
             bias=config.r_conv2_bias,
         )
-        self.activation = nn.GELU()
+        self.activation = ACT2FN[config.feat_extract_activation]
 
         self.layer_norm = nn.GroupNorm(1, self.out_conv_ch, affine=True)
-        
-        # for m in self.modules():
-        #     if isinstance(m, nn.Conv2d):
-        #         nn.init.kaiming_normal_(m.weight)
-        #     elif isinstance(m, nn.LayerNorm):
-        #         # nn.init.constant_(m.weight, 1)
-        #         # nn.init.constant_(m.bias, 0)
-        #         m.bias.data.zero_()
-        #         m.weight.data.fill_(1.0)
 
     def forward(self, hidden_states):
         hidden_states = self.conv(hidden_states)
@@ -1563,120 +1562,53 @@ class Raadar2VecLayerNormConvLayer(nn.Module):
         hidden_states = self.activation(hidden_states)
         return hidden_states
 
-
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=dilation, groups=groups, bias=False, dilation=dilation)
-
-def conv1x1(in_planes, out_planes, stride=1):
-    """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(BasicBlock, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.GroupNorm
-        if groups != 1 or base_width != 64:
-            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
-        if dilation > 1:
-            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
-        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.ln1 = norm_layer(1, planes, affine=True)
-        self.activation = nn.GELU()
-        self.conv2 = conv3x3(planes, planes)
-        self.ln2 = norm_layer(1, planes, affine=True)
-        self.downsample = downsample
-        self.stride = stride
-        
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.ln1(out)
-        out = self.activation(out)
-
-        out = self.conv2(out)
-        out = self.ln2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.activation(out)
-
-        return out
-    
-    
-class Radar2VecBasicBlockConvLayer(nn.Module):
-    def __init__(self, config: Wav2Vec2Config, layer_id=0):
+class Radar2VecNoLayerNorm2DConvLayer(nn.Module):
+    def __init__(self, config, layer_id=0):
         super().__init__()
-        self.inplanes = config.r_conv2_ch[layer_id-1]
-        self.out_conv_ch = config.r_conv2_ch[layer_id]
-        
-        self.conv = self._make_layer(config, BasicBlock,
-            self.out_conv_ch,
-            config.r_conv2_layer[layer_id],
-            stride=config.r_conv2_stride[layer_id],
-        )
-        self.activation = nn.GELU()
-        
-    def _make_layer(self, config, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                nn.GroupNorm(1, planes * block.expansion, affine=True),
-            )
-
-        layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, hidden_states):
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
-    
-    
-class Raadar2VecPointwiseConv(nn.Module):
-    def __init__(self, config: Wav2Vec2Config, layer_id=0):
-        super().__init__()
-        self.in_conv_ch = config.r_conv2_feq[layer_id] if layer_id > 0 else 1
-        self.out_conv_ch = config.r_conv2_ch[layer_id]
+        self.in_conv_dim = config.r_conv2_ch[layer_id-1] 
+        self.out_conv_dim = config.r_conv2_ch[layer_id]
 
         self.conv = nn.Conv2d(
-            self.in_conv_ch,
-            self.out_conv_ch,
+            self.in_conv_dim,
+            self.out_conv_dim,
             kernel_size=config.r_conv2_kernel[layer_id],
             stride=config.r_conv2_stride[layer_id],
             padding=config.r_conv2_padding[layer_id],
-            bias=config.r_conv2_bias,
+            bias=config.conv_bias,
         )
-        self.activation = nn.GELU()
+        
+        self.activation = ACT2FN[config.feat_extract_activation]
+        self.pool = nn.MaxPool2d(kernel_size=(config.r_conv2_pool[layer_id],1), stride=(2,1),padding=(0,0))
 
-        # self.layer_norm = nn.GroupNorm(1, self.out_conv_ch, affine=True)
-
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.transpose(1,2)
+    def forward(self, hidden_states):        
         hidden_states = self.conv(hidden_states)
         hidden_states = self.activation(hidden_states)
-        hidden_states = hidden_states.transpose(1,2)
-        # hidden_states = self.layer_norm(hidden_states)
-        # hidden_states = self.activation(hidden_states)
+        hidden_states = self.pool(hidden_states)
         return hidden_states
-    
 
-class Radar2VecNoLayerNormConvLayer(nn.Module):
+class Radar2VecNoLayerNormPool2DConvLayer(nn.Module):
+    def __init__(self, config, layer_id=0):
+        super().__init__()
+        self.in_conv_dim = config.r_conv2_ch[layer_id-1] 
+        self.out_conv_dim = config.r_conv2_ch[layer_id]
+
+        self.conv = nn.Conv2d(
+            self.in_conv_dim,
+            self.out_conv_dim,
+            kernel_size=config.r_conv2_kernel[layer_id],
+            stride=config.r_conv2_stride[layer_id],
+            padding=config.r_conv2_padding[layer_id],
+            bias=config.conv_bias,
+        )
+        
+        self.activation = ACT2FN[config.feat_extract_activation]
+
+    def forward(self, hidden_states):        
+        hidden_states = self.conv(hidden_states)
+        hidden_states = self.activation(hidden_states)
+        return hidden_states        
+
+class Radar2VecNoLayerNorm1DConvLayer(nn.Module):
     def __init__(self, config, layer_id=0):
         super().__init__()
         self.in_conv_dim = config.r_conv1_dim[layer_id] 
@@ -1694,27 +1626,24 @@ class Radar2VecNoLayerNormConvLayer(nn.Module):
 
     def forward(self, hidden_states):
         if hidden_states.size(2) == 1:
-            hidden_states = np.squeeze(hidden_states, axis=2)
+            hidden_states = hidden_states.squeeze(2)
         
         hidden_states = self.conv(hidden_states)
         hidden_states = self.activation(hidden_states)
         return hidden_states
 
-    
 class Radar2VecFeatureExtractor(nn.Module):
     """Construct the featurs from raw audio waveform"""
 
     def __init__(self, config: Wav2Vec2Config):
         super().__init__()
 
-
-        conv_layers = [Raadar2VecLayerNormConvLayer(config, layer_id=0)] + [
-            Radar2VecBasicBlockConvLayer(config, layer_id=i + 1) for i in range(config.num_2d_layers - 1)
-        ] + [Raadar2VecPointwiseConv(config, layer_id=i + config.num_2d_layers) for i in range(config.num_2d_len - config.num_2d_layers)
-        ] + [Radar2VecNoLayerNormConvLayer(config, layer_id=i) for i in range(config.num_1d_len)]
+        conv_layers = [Raadar2VecLayerNorm2DConvLayer(config, layer_id=0)] + [
+            Radar2VecNoLayerNorm2DConvLayer(config, layer_id=i + 1) for i in range(config.num_2d_layers - 2)
+        ] + [Radar2VecNoLayerNormPool2DConvLayer(config, layer_id = config.num_2d_layers-1)
+        ] + [Radar2VecNoLayerNorm1DConvLayer(config, layer_id=i) for i in range(config.num_1d_layers)]
         
         self.conv_layers = nn.ModuleList(conv_layers)
-             
 
     def _freeze_parameters(self):
         for param in self.parameters():
@@ -1724,10 +1653,7 @@ class Radar2VecFeatureExtractor(nn.Module):
         hidden_states = input_values
         for conv_layer in self.conv_layers:
             hidden_states = conv_layer(hidden_states)
-
         return hidden_states
-
-
 
 @add_start_docstrings(
     "The bare Wav2Vec2 Model transformer outputting raw hidden-states without any specific head on top.",
@@ -1738,6 +1664,8 @@ class Radar2VecModel(nn.Module):
         super().__init__()
         self.config = config
         self.feature_extractor = Radar2VecFeatureExtractor(config)
+        # self.layer_nom = self.layer_norm = nn.LayerNorm(config.r_conv1_dim[-1], eps=config.layer_norm_eps)
+        # self.feature_projection = Wav2Vec2FeatureProjection(config)
         
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -1751,150 +1679,230 @@ class Radar2VecModel(nn.Module):
 
     @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
     # @replace_return_docstrings(output_type=None, config_class=_CONFIG_FOR_DOC)
+    # @replace_return_docstrings(output_type=BaseModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_values,
         
     ):
+        extract_features = self.feature_extractor(input_values)
+        extract_features = extract_features.transpose(1, 2)
+        hidden_states = 0
+        # extract_features = self.layer_nom(extract_features)
+        # hidden_states, extract_features = self.feature_projection(extract_features)
+
+        return Wav2Vec2BaseModelOutput(
+            last_hidden_state=hidden_states,
+            extract_features=extract_features,
+            hidden_states=hidden_states,
+        )
+
+
+
+@add_start_docstrings(
+    "The bare Wav2Vec2 Model transformer outputting raw hidden-states without any specific head on top.",
+    WAV_2_VEC_2_START_DOCSTRING,
+)
+class Wav2Vec2ModelForRadar(Wav2Vec2PreTrainedModel):
+    def __init__(self, config: Wav2Vec2Config):
+        super().__init__(config)
+        self.config = config
+        self.feature_extractor = Radar2VecFeatureExtractor(config) #Wav2Vec2FeatureExtractor(config)
+        self.feature_projection = Wav2Vec2FeatureProjection(config)
+
+        self.masked_spec_embed = nn.Parameter(torch.FloatTensor(config.hidden_size).uniform_())
+
+        if config.do_stable_layer_norm:
+            self.encoder = Wav2Vec2EncoderStableLayerNorm(config)
+        else:
+            self.encoder = Wav2Vec2Encoder(config)
+
+        self.init_weights()
+
+    def _mask_hidden_states(
+        self,
+        hidden_states: torch.FloatTensor,
+        mask_time_indices: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+    ):
+        """
+        Masks extracted features along time axis and/or along feature axis according to `SpecAugment
+        <https://arxiv.org/abs/1904.08779>`__ .
+        """
+
+        # `config.apply_spec_augment` can set masking to False
+        if not getattr(self.config, "apply_spec_augment", True):
+            return hidden_states
+
+        # generate indices & apply SpecAugment along time axis
+        batch_size, sequence_length, hidden_size = hidden_states.size()
+
+        if mask_time_indices is not None:
+            # apply SpecAugment along time axis with given mask_time_indices
+            hidden_states[mask_time_indices] = self.masked_spec_embed.to(hidden_states.dtype)
+        elif self.config.mask_time_prob > 0 and self.training:
+            mask_time_indices = _compute_mask_indices(
+                (batch_size, sequence_length),
+                mask_prob=self.config.mask_time_prob,
+                mask_length=self.config.mask_time_length,
+                device=hidden_states.device,
+                attention_mask=attention_mask,
+                min_masks=2,
+            )
+            hidden_states[mask_time_indices] = self.masked_spec_embed.to(hidden_states.dtype)
+
+        if self.config.mask_feature_prob > 0 and self.training:
+            # generate indices & apply SpecAugment along feature axis
+            mask_feature_indices = _compute_mask_indices(
+                (batch_size, hidden_size),
+                mask_prob=self.config.mask_feature_prob,
+                mask_length=self.config.mask_feature_length,
+                device=hidden_states.device,
+                attention_mask=attention_mask,
+            )
+            hidden_states[mask_feature_indices[:, None].expand(-1, sequence_length, -1)] = 0
+
+        return hidden_states
+
+    @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
+    # @replace_return_docstrings(output_type=BaseModelOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_values,
+        attention_mask=None,
+        mask_time_indices=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+       
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         extract_features = self.feature_extractor(input_values)
-        # extract_features = extract_features.transpose(1, 2)
+        extract_features = extract_features.transpose(1, 2)
 
-        return extract_features
+        # extract_features = input_values
+        # hidden_states = input_values
+        if attention_mask is not None:
+            # compute reduced attention_mask correponding to feature vectors
+            attention_mask = self._get_feature_vector_attention_mask(extract_features.shape[1], attention_mask)
+
+        hidden_states, extract_features = self.feature_projection(extract_features)
+        hidden_states = self._mask_hidden_states(
+            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
+        )
+
+        encoder_outputs = self.encoder(
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = encoder_outputs[0]
+
+        if not return_dict:
+            return (hidden_states, extract_features) + encoder_outputs[1:]
+
+        return Wav2Vec2BaseModelOutput(
+            last_hidden_state=hidden_states,
+            extract_features=extract_features,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
 
 
 
+@add_start_docstrings(
+    """Wav2Vec2 Model with a `language modeling` head on top for Connectionist Temporal Classification (CTC). """,
+    WAV_2_VEC_2_START_DOCSTRING,
+)
+class Radar2Vec(Wav2Vec2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
 
+        self.wav2vec2 = Wav2Vec2ModelForRadar(config)
+        self.dropout = nn.Dropout(config.final_dropout)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
 
-# In[]
+        self.init_weights()
 
-# @add_start_docstrings(
-#     """Wav2Vec2 Model with a `language modeling` head on top for Connectionist Temporal Classification (CTC). """,
-#     WAV_2_VEC_2_START_DOCSTRING,
-# )
-# class Radar2Vec(Wav2Vec2PreTrainedModel):
-#     def __init__(self, config):
-#         super().__init__(config)
+    def freeze_feature_extractor(self):
+        """
+        Calling this function will disable the gradient computation for the feature extractor so that its parameter
+        will not be updated during training.
+        """
+        self.wav2vec2.feature_extractor._freeze_parameters()
 
-#         self.wav2vec2 = Wav2Vec2Model(config)
-#         self.dropout = nn.Dropout(config.final_dropout)
-#         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
+    @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
+    # @replace_return_docstrings(output_type=CausalLMOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_values,
+        attention_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        labels=None,
+    ):
 
-#         self.init_weights()
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-#     def freeze_feature_extractor(self):
-#         """
-#         Calling this function will disable the gradient computation for the feature extractor so that its parameter
-#         will not be updated during training.
-#         """
-#         self.wav2vec2.feature_extractor._freeze_parameters()
+        outputs = self.wav2vec2(
+            input_values,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
 
-#     @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
-#     @replace_return_docstrings(output_type=CausalLMOutput, config_class=_CONFIG_FOR_DOC)
-#     def forward(
-#         self,
-#         input_values,
-#         attention_mask=None,
-#         output_attentions=None,
-#         output_hidden_states=None,
-#         return_dict=None,
-#         labels=None,
-#     ):
-#         r"""
-#         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, target_length)`, `optional`):
-#             Labels for connectionist temporal classification. Note that ``target_length`` has to be smaller or equal to
-#             the sequence length of the output logits. Indices are selected in ``[-100, 0, ..., config.vocab_size -
-#             1]``. All labels set to ``-100`` are ignored (masked), the loss is only computed for labels in ``[0, ...,
-#             config.vocab_size - 1]``.
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
 
-#         Returns:
+        logits = self.lm_head(hidden_states)
 
-#         Example::
+        loss = None
+        if labels is not None:
 
-#             >>> import torch
-#             >>> from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-#             >>> from datasets import load_dataset
-#             >>> import soundfile as sf
+            if labels.max() >= self.config.vocab_size:
+                raise ValueError(f"Label values must be <= vocab_size: {self.config.vocab_size}")
 
-#             >>> processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-#             >>> model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
+            # retrieve loss input_lengths from attention_mask
+            attention_mask = (
+                attention_mask if attention_mask is not None else torch.ones_like(input_values, dtype=torch.long)
+            )
+            input_lengths = self._get_feat_extract_output_lengths(attention_mask.sum(-1)).to(torch.long)
 
-#             >>> def map_to_array(batch):
-#             >>>     speech, _ = sf.read(batch["file"])
-#             >>>     batch["speech"] = speech
-#             >>>     return batch
+            # assuming that padded tokens are filled with -100
+            # when not being attended to
+            labels_mask = labels >= 0
+            target_lengths = labels_mask.sum(-1)
+            flattened_targets = labels.masked_select(labels_mask)
 
-#             >>> ds = load_dataset("patrickvonplaten/librispeech_asr_dummy", "clean", split="validation")
-#             >>> ds = ds.map(map_to_array)
+            # ctc_loss doesn't support fp16
+            log_probs = nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32).transpose(0, 1)
 
-#             >>> input_values = processor(ds["speech"][0], return_tensors="pt").input_values  # Batch size 1
-#             >>> logits = model(input_values).logits
-#             >>> predicted_ids = torch.argmax(logits, dim=-1)
+            with torch.backends.cudnn.flags(enabled=False):
+                loss = nn.functional.ctc_loss(
+                    log_probs,
+                    flattened_targets,
+                    input_lengths,
+                    target_lengths,
+                    blank=self.config.pad_token_id,
+                    reduction=self.config.ctc_loss_reduction,
+                    zero_infinity=self.config.ctc_zero_infinity,
+                )
 
-#             >>> transcription = processor.decode(predicted_ids[0])
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
 
-#             >>> # compute loss
-#             >>> target_transcription = "A MAN SAID TO THE UNIVERSE SIR I EXIST"
-
-#             >>> # wrap processor as target processor to encode labels
-#             >>> with processor.as_target_processor():
-#             >>>     labels = processor(target_transcription, return_tensors="pt").input_ids
-
-#             >>> loss = model(input_values, labels=labels).loss
-#         """
-
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-#         outputs = self.wav2vec2(
-#             input_values,
-#             attention_mask=attention_mask,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#         )
-
-#         hidden_states = outputs[0]
-#         hidden_states = self.dropout(hidden_states)
-
-#         logits = self.lm_head(hidden_states)
-
-#         loss = None
-#         if labels is not None:
-
-#             if labels.max() >= self.config.vocab_size:
-#                 raise ValueError(f"Label values must be <= vocab_size: {self.config.vocab_size}")
-
-#             # retrieve loss input_lengths from attention_mask
-#             attention_mask = (
-#                 attention_mask if attention_mask is not None else torch.ones_like(input_values, dtype=torch.long)
-#             )
-#             input_lengths = self._get_feat_extract_output_lengths(attention_mask.sum(-1)).to(torch.long)
-
-#             # assuming that padded tokens are filled with -100
-#             # when not being attended to
-#             labels_mask = labels >= 0
-#             target_lengths = labels_mask.sum(-1)
-#             flattened_targets = labels.masked_select(labels_mask)
-
-#             # ctc_loss doesn't support fp16
-#             log_probs = nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32).transpose(0, 1)
-
-#             with torch.backends.cudnn.flags(enabled=False):
-#                 loss = nn.functional.ctc_loss(
-#                     log_probs,
-#                     flattened_targets,
-#                     input_lengths,
-#                     target_lengths,
-#                     blank=self.config.pad_token_id,
-#                     reduction=self.config.ctc_loss_reduction,
-#                     zero_infinity=self.config.ctc_zero_infinity,
-#                 )
-
-#         if not return_dict:
-#             output = (logits,) + outputs[2:]
-#             return ((loss,) + output) if loss is not None else output
-
-#         return CausalLMOutput(
-#             loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
-#         )
+        return CausalLMOutput(
+            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
+        )
 

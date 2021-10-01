@@ -153,17 +153,16 @@ class Wav2Vec2Config(PretrainedConfig):
 
     def __init__(
         self,
-        r_conv1_dim=(64, 512, 512),
-        r_conv1_stride=(1, 1, 2),
-        r_conv1_kernel=(3, 3, 3),
-        r_conv1_padding=(1, 1, 0),
+       r_conv1_dim=(512, 512),
+        r_conv1_stride=(1, 2),
+        r_conv1_kernel=(3, 3),
+        r_conv1_padding=(1, 0),
         r_conv1_bias=False,
-        r_conv2_ch=(32, 64, 1),
-        r_conv2_feq=(256, 256, 256),
-        r_conv2_stride=(1, 1, 1),
-        r_conv2_kernel=(3, 3, 1),
-        r_conv2_padding=(1, 1, 0),
-        r_conv2_layer=(1, 2),
+        r_conv2_ch=(64, 128, 256, 512), 
+        r_conv2_stride=[1, 1, 1, 1],
+        r_conv2_kernel=[(5,5), (3,3), (3,3), (64,1)],
+        r_conv2_padding=[(2,2), (1,1), (1,1), 0],
+        r_conv2_pool = [1, 2, 2, 2, 1],
         r_conv2_bias=False,
         vocab_size=32,
         hidden_size=768,
@@ -215,16 +214,14 @@ class Wav2Vec2Config(PretrainedConfig):
         self.r_conv1_kernel = list(r_conv1_kernel)
         self.r_conv1_padding = list(r_conv1_padding)
         self.r_conv1_bias = r_conv1_bias
-        self.num_1d_len = len(self.r_conv1_dim)
-        self.r_conv2_feq = list(r_conv2_feq)
+        self.num_1d_layers = len(self.r_conv1_dim)
         self.r_conv2_ch = list(r_conv2_ch)
         self.r_conv2_stride = list(r_conv2_stride)
         self.r_conv2_kernel = list(r_conv2_kernel)
-        self.r_conv2_layer = list(r_conv2_layer)
         self.r_conv2_padding = list(r_conv2_padding)
         self.r_conv2_bias = r_conv2_bias
-        self.num_2d_layers = len(self.r_conv2_layer)
-        self.num_2d_len = len(self.r_conv2_ch)
+        self.r_conv2_pool = r_conv2_pool
+        self.num_2d_layers = len(self.r_conv2_ch)
         self.hidden_size = hidden_size
         self.feat_extract_norm = feat_extract_norm
         self.feat_extract_activation = feat_extract_activation

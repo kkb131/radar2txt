@@ -331,6 +331,8 @@ class CausalLMOutput(ModelOutput):
     logits: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    hidden_states2: Optional[torch.FloatTensor] = None
+    extract_features2: Optional[torch.FloatTensor] = None
 
 
 @dataclass
